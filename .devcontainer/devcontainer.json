@@ -29,21 +29,27 @@
 				"python.languageServer": "Default",
 				"python.formatting.autopep8Path": "/usr/local/py-utils/bin/autopep8",
 				"python.formatting.blackPath": "/usr/local/py-utils/bin/black",
-				"python.formatting.yapfPath": "/usr/local/py-utils/bin/yapf",
+				"python.formatting.yapfPath": "/usr/local/py-utils/bin/yapf"
 			},
 			
 			// Add the IDs of extensions you want installed when the container is created.
 			"extensions": [
 				"ms-python.python",
+				"ms-python.debugpy",
+				"ms-python.jupyter",
+				"ms-toolsai.jupyter",
 				"ms-python.vscode-pylance",
-				"ms-python.autopep8"
+				"ms-python.autopep8",
+				"mechatroner.rainbow-csv",
+				"github.copilot",
+				"github.copilot-chat"
 			]
 		}
 	},
 
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
 	"forwardPorts": [80],
-
+	
 	// Use 'portsAttributes' to set default properties for specific forwarded ports. More info: https://code.visualstudio.com/docs/remote/devcontainerjson-reference.
 	// "portsAttributes": {
 	// 	"9000": {
@@ -75,7 +81,6 @@
 		"--rm",
 		"--privileged",
 		// "--volume=/tmp/.X11-unix:/tmp/.X11-unix:rw",
-		"--volume=${localEnv:HOME}/tmp.Xauthority:/tmp/.Xauthority",
-		"--net=host"
+		"--volume=${localEnv:HOME}/tmp.Xauthority:/tmp/.Xauthority"
 	]
 }
