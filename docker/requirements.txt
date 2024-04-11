@@ -1,4 +1,10 @@
 mip
 numpy
 matplotlib
+seaborn
 pulp
+pandas
+joblib
+flask
+streamlit
+ipykernel
