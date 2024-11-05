@@ -6,8 +6,11 @@ import itertools
 import pandas as pd
 import matplotlib.pyplot as plt
 import pulp
-import relax_problem
 from abstract_milp import AbstractMILP
+import random
+import numpy as np
+
+
 class SimpleCAPP(AbstractMILP):
     """Simple Computer-Aided Process Planning (CAPP) class"""
     def __init__(self, products, product_tasks, main_component_sets, aux_component_sets, initial_costs, aux_initial_costs, labor_costs, aux_labor_costs, operator_counts, task_times, aux_requirements, amount, time_period, stations, changeover_times, import_times, export_times, transport_times, transport_can_be_bottleneck, problem_name="Production_Line_Optimization"):
@@ -34,7 +37,7 @@ class SimpleCAPP(AbstractMILP):
         self.problem_name = problem_name
         # Define the problem
         self.prob = pulp.LpProblem(self.problem_name, pulp.LpMinimize)
-        self.M = 1000000000 # a large number
+        self.M = time_period # a large number. must be larger than any cycletime, therefore, use production time period. if too large, the problem may be infeasible or return wrong solution.
 
     def declare_variables(self):
         # The variables dict will hold the decision variables
@@ -57,9 +60,10 @@ class SimpleCAPP(AbstractMILP):
         # operator worktime for each component set in each station for each product. effected by settings[labor_cost_on_exact_cycletime]. 
         self.operator_paid_worktime = pulp.LpVariable.dicts("WorkerPaidWorkTime", [(p,c,s) for p in self.products for c in self.main_component_sets for s in self.stations], lowBound=0, cat=pulp.LpContinuous)
         self.aux_operator_paid_worktime = pulp.LpVariable.dicts("AuxWorkerPaidWorkTime", [(p,ac,s) for p in self.products for ac in self.aux_component_sets for s in self.stations], lowBound=0, cat=pulp.LpContinuous)
-        self.overall_cycle_time = pulp.LpVariable.dicts("OverallCycleTime", [p for p in self.products], lowBound=0, cat=pulp.LpContinuous)
+        self.product_cycle_time = pulp.LpVariable.dicts("ProductCycleTime", [p for p in self.products], lowBound=0, cat=pulp.LpContinuous)
+        self.production_time = pulp.LpVariable("OverallCycleTime", lowBound=0, cat=pulp.LpContinuous)
         # trans is 1 if the task t_1 and next task t_2 are assigned to the different stations s_1 and s_2. ! jobshopがなければtransとassigned_same_stationは片方だけでいいと思われる。!
-        self.trans = pulp.LpVariable.dicts("Transportation", [(p,t_1,t_2,s_1,s_2) for p in self.products for t_1, t_2 in zip(self.product_tasks[p], self.product_tasks[p][1:]) for s_1 in self.stations for s_2 in self.stations], cat=pulp.LpBinary)
+        self.trans = pulp.LpVariable.dicts("Transportation", [(p,t_1,t_2,s_1,s_2) for p in self.products for t_1, t_2 in zip(self.product_tasks[p], self.product_tasks[p][1:]) for s_1 in self.stations for s_2 in self.stations], lowBound=0, cat=pulp.LpBinary)
     
     def __total_cost(self):
         return self.__total_initial_cost() + self.__total_labor_cost()
@@ -77,11 +81,14 @@ class SimpleCAPP(AbstractMILP):
               + pulp.lpSum([self.aux_labor_costs[ac]*self.aux_operator_paid_worktime[p,ac,s] for p in self.products for ac in self.aux_component_sets for s in self.stations])
     
     def __total_production_time(self):
-        # TODO: １つ流しの混流生産ならば、製品ごとのoverall_cycle_timeではなく、ステーションごとのcycletime*amountとするべき。ボトルネック工程が被らなければ、overall_cycle_timeよりも短い期間ですむ。bottleneck_stationをlpvariableとして設定するべき。
-        # TODO: バッチ生産ならば、製品ごとのoverall_timeであるべき。
-        return pulp.lpSum([self.amount[p] * self.overall_cycle_time[p] for p in self.products])
+        if self.settings['batch_production']:
+            return pulp.lpSum([self.amount[p] * self.product_cycle_time[p] for p in self.products])
+        elif self.settings['one_piece_flow']:
+            return self.production_time
+        else:
+            raise Exception("Choose one of batch_production or one_piece_flow.")
     
-    def __total_transport_time(self):
+    def __total_transport_time(self, result=False):
         # transport time from station 0 to first station of each product + transport time between each task-assigned stations
         return pulp.lpSum(self.amount[p] * pulp.lpSum(self.transport_times[self.stations[0], s] * self.assigned[p,self.product_tasks[p][0],c,s] for c in self.main_component_sets for s in self.stations) for p in self.products) \
          + pulp.lpSum([self.amount[p] * pulp.lpSum([self.transport_times[s_1,s_2]*self.trans[p,t_1,t_2,s_1,s_2] for t_1, t_2 in zip(self.product_tasks[p], self.product_tasks[p][1:]) for s_1 in self.stations for s_2 in self.stations]) for p in self.products])
@@ -90,7 +97,7 @@ class SimpleCAPP(AbstractMILP):
         # 1st Objective function: Minimize the total cost
         self.add_objective(obj=self.__total_cost(), sense=pulp.LpMinimize, name="TotalCost")
         # 2nd Objective function: Minimize the total production time
-        self.add_objective(obj=self.__total_production_time(), sense=pulp.LpMinimize, name="TotalProductionTime", relativeTol=1.1) # 10% tolerance for total production time constraint
+        self.add_objective(obj=self.__total_production_time(), sense=pulp.LpMinimize, name="TotalProductionTime") # 1% tolerance for total production time constraint
         # 3rd Objective function: Minimize the transport Time
         self.add_objective(obj=self.__total_transport_time(), sense=pulp.LpMinimize, name="TotalTransportTime")
     
@@ -155,10 +162,13 @@ class SimpleCAPP(AbstractMILP):
                         self.prob += pulp.lpSum(self.assigned[p,t_2,c,self.stations[s_1]] for c in self.main_component_sets) <= pulp.lpSum(self.assigned[p,t_1,c,s] for s in self.stations[:s_1+1] for c in self.main_component_sets), f"TaskOrder_{t_1}to{t_2}_at_{s_1}"
 
     def __cycletime_constraint(self):
-        # overall cycle time must be larger than the cycle time of each station
+        # product cycle time must be larger than the cycle time of each station
         for p in self.products:
             for s in self.stations:
-                self.prob += self.cycletime[p,s] <= self.overall_cycle_time[p], f"OverallCycleTime_{p}_{s}"
+                self.prob += self.cycletime[p,s] <= self.product_cycle_time[p], f"ProductCycleTime_{p}_{s}"
+        # overall cycle time must be larger than the bottleneck station cycle time * amount
+        for s in self.stations:
+            self.prob += self.production_time >= pulp.lpSum(self.amount[p] * self.cycletime[p,s] for p in self.products), f"ProductionTime_{s}"
 
         # If task t_1 and next task t_2 are assigned to station s_1, s_2, trans must be 1
         for p in self.products:
@@ -169,6 +179,9 @@ class SimpleCAPP(AbstractMILP):
                             self.prob += pulp.lpSum([self.assigned[p,t_1,c,s_1] for c in self.main_component_sets]) >= self.trans[p,t_1,t_2,s_1,s_2], f"Transport_{t_1}_{t_2}_{s_1}_{s_2}_must_be_0_if_{p}_{t_1}_not_assigned_to_{s_1}"
                             self.prob += pulp.lpSum([self.assigned[p,t_2,c,s_2] for c in self.main_component_sets]) >= self.trans[p,t_1,t_2,s_1,s_2], f"Transport_{t_1}_{t_2}_{s_1}_{s_2}_must_be_0_if_{p}_{t_2}_not_assigned_to_{s_2}"
                             self.prob += pulp.lpSum([self.assigned[p,t_1,c,s_1] for c in self.main_component_sets]) + pulp.lpSum([self.assigned[p,t_2,c,s_2] for c in self.main_component_sets]) - 1 <= self.trans[p,t_1,t_2,s_1,s_2], f"Transport_{t_1}_{t_2}_{s_1}_{s_2}_must_be_1_if_{p}_{t_1}_assigned_{s_1}_and_{p}_{t_2}_assigned_{s_2}"
+                        else:
+                            self.prob += self.trans[p,t_1,t_2,s_1,s_2] == 0, f"Transport_{t_1}_{t_2}_{s_1}_{s_2}_must_be_0_if_{s_1}_{s_2}_are_same"
+
         # if transport_can_be_bottleneck is True, overal cycle time must be larger than the transport time
         for p in self.products:
             for t_1, t_2 in zip(self.product_tasks[p], self.product_tasks[p][1:]):
@@ -176,7 +189,7 @@ class SimpleCAPP(AbstractMILP):
                     for s_2 in self.stations:
                         if s_1 != s_2:
                             if self.transport_can_be_bottleneck[(s_1,s_2)]:
-                                self.prob += self.trans[p,t_1,t_2,s_1,s_2] * self.transport_times[(s_1,s_2)] <= self.overall_cycle_time[p], f"OverallCycleTime_{p}_GT_TransportTime_{p}_{t_1}_{t_2}_{s_1}_{s_2}"
+                                self.prob += self.trans[p,t_1,t_2,s_1,s_2] * self.transport_times[(s_1,s_2)] <= self.product_cycle_time[p], f"ProductCycleTime_{p}_GT_TransportTime_{p}_{t_1}_{t_2}_{s_1}_{s_2}"
 
         # If task t_1,t_2 are assigned to the same station
         for p in self.products:
@@ -197,8 +210,10 @@ class SimpleCAPP(AbstractMILP):
                  + pulp.lpSum((self.assigned[p,t_2,c,s] - self.assigned_same_station[p,t_1,t_2,c,s]) * self.import_times[c] for c in self.main_component_sets for t_1, t_2 in zip(self.product_tasks[p], self.product_tasks[p][1:])) \
                  + pulp.lpSum((self.assigned[p,t_1,c,s] - self.assigned_same_station[p,t_1,t_2,c,s]) * self.export_times[c] for c in self.main_component_sets for t_1, t_2 in zip(self.product_tasks[p], self.product_tasks[p][1:])) \
                  + pulp.lpSum(self.assigned_same_station[p,t_1,t_2,c,s] * self.changeover_times[(c,t_1,t_2)] for t_1, t_2 in zip(self.product_tasks[p], self.product_tasks[p][1:]) for c in self.main_component_sets) <= self.cycletime[p,s], f"CycleTime_{s}_{p}"
+                # cycle time must be zero if the station is not equipped with any component set
+                self.prob += self.cycletime[p,s] <= self.M * pulp.lpSum(self.equipped[c,s] for c in self.main_component_sets), f"CycleTime_{s}_{p}_M"
 
-        # The sum of overallcycletime*amount must be less than or equal to the time_period (all product must be produced to amount in time_period)
+        # The total production time must be less than or equal to the time_period (all product must be produced to amount in time_period)
         self.prob += self.__total_production_time() <= self.time_period, "TotalCycleTime"
 
     def __operator_constraint(self):
@@ -213,9 +228,9 @@ class SimpleCAPP(AbstractMILP):
                         self.prob += self.operator_paid_worktime[p,c,s] <= self.amount[p]*self.cycletime[p,s], f"WorkerPaidWorkTime_{p}_{c}_{s}"
                         self.prob += self.amount[p]*self.cycletime[p,s] - self.operator_paid_worktime[p,c,s] <= self.M * (1 - self.equipped[c,s]), f"WorkerPaidWorkTime_{p}_{c}_{s}_M2"
                     else:
-                        # worktime is calculated by the overall cycle time of the product. operator cannot do any other job. 
-                        self.prob += self.operator_paid_worktime[p,c,s] <= self.amount[p]*self.overall_cycle_time[p], f"WorkerPaidWorkTime_{p}_{c}_{s}"
-                        self.prob += self.amount[p]*self.overall_cycle_time[p] - self.operator_paid_worktime[p,c,s] <= self.M * (1 - self.equipped[c,s]), f"WorkerPaidWorkTime_{p}_{c}_{s}_M2"
+                        # worktime is calculated by the product cycle time. operator cannot do any other job. 
+                        self.prob += self.operator_paid_worktime[p,c,s] <= self.amount[p]*self.product_cycle_time[p], f"WorkerPaidWorkTime_{p}_{c}_{s}"
+                        self.prob += self.amount[p]*self.product_cycle_time[p] - self.operator_paid_worktime[p,c,s] <= self.M * (1 - self.equipped[c,s]), f"WorkerPaidWorkTime_{p}_{c}_{s}_M2"
 
         # aux operator worktime constraint
         for p in self.products:
@@ -228,9 +243,9 @@ class SimpleCAPP(AbstractMILP):
                         self.prob += self.aux_operator_paid_worktime[p,ac,s] <= self.amount[p]*self.cycletime[p,s], f"AuxWorkerPaidWorkTime_{p}_{ac}_{s}"
                         self.prob += self.amount[p]*self.cycletime[p,s] - self.aux_operator_paid_worktime[p,ac,s] <= self.M * (1 - self.aux_equipped[ac,s]), f"AuxWorkerPaidWorkTime_{p}_{ac}_{s}_M2"
                     else:
-                        # worktime is calculated by the overall cycle time of the product. operator cannot do any other job. 
-                        self.prob += self.aux_operator_paid_worktime[p,ac,s] <= self.amount[p]*self.overall_cycle_time[p], f"AuxWorkerPaidWorkTime_{p}_{ac}_{s}"
-                        self.prob += self.amount[p]*self.overall_cycle_time[p] - self.aux_operator_paid_worktime[p,ac,s] <= self.M * (1 - self.aux_equipped[ac,s]), f"AuxWorkerPaidWorkTime_{p}_{ac}_{s}_M2"
+                        # worktime is calculated by the product cycle time. operator cannot do any other job. 
+                        self.prob += self.aux_operator_paid_worktime[p,ac,s] <= self.amount[p]*self.product_cycle_time[p], f"AuxWorkerPaidWorkTime_{p}_{ac}_{s}"
+                        self.prob += self.amount[p]*self.product_cycle_time[p] - self.aux_operator_paid_worktime[p,ac,s] <= self.M * (1 - self.aux_equipped[ac,s]), f"AuxWorkerPaidWorkTime_{p}_{ac}_{s}_M2"
 
         # operator count constraint
         if self.settings['max_operator_count'] >= 0:
@@ -241,7 +256,7 @@ class SimpleCAPP(AbstractMILP):
         print("Solver:", self.solver.name)
         print([f"{obj.name}:{pulp.LpStatus[stat]}" for obj,stat in zip(self.objectives, self.statuses)])
 
-        if all(stat in (pulp.LpStatusOptimal, pulp.LpStatusNotSolved) for stat in self.statuses):
+        if all(stat in (pulp.LpStatusOptimal, pulp.LpStatusUndefined) for stat in self.statuses):
             for v in self.prob.variables():
                 print(v.name, "=", v.varValue)
             print("Total Cost = ", pulp.value(self.__total_cost()))
@@ -256,9 +271,9 @@ class SimpleCAPP(AbstractMILP):
         for p in self.products:
             for s in self.stations:
                 for c in self.main_component_sets:
-                    if any(self.assigned[p,t,c,s].varValue > 0 for t in self.product_tasks[p]):
-                        result_assignment_data.append({'Product': p, 'Station': s, 'Task': ','.join([t for t in self.product_tasks[p] if self.assigned[p,t,c,s].varValue > 0]), 
-                                                       'Component Set': c, 'Aux Component Set': ','.join([ac for ac in self.aux_component_sets if self.aux_equipped[ac,s].varValue > 0]), 'Cycle Time': self.cycletime[p,s].varValue, 
+                    if any(self.assigned[p,t,c,s].varValue > 0.99 for t in self.product_tasks[p]):
+                        result_assignment_data.append({'Product': p, 'Station': s, 'Task': ','.join([t for t in self.product_tasks[p] if self.assigned[p,t,c,s].varValue > 0.99]), 
+                                                       'Component Set': c, 'Aux Component Set': ','.join([ac for ac in self.aux_component_sets if self.aux_equipped[ac,s].varValue > 0.99]), 'Cycle Time': self.cycletime[p,s].varValue, 
                                  'Prod Amount':self.amount[p], 'Operator Paid Work Time': self.operator_paid_worktime[p,c,s].varValue})
                                 
         self.result_assignment_df = pd.DataFrame(result_assignment_data)
@@ -267,28 +282,35 @@ class SimpleCAPP(AbstractMILP):
             for t_i, t in enumerate(self.product_tasks[p]):
                 for s in self.stations:
                     for c in self.main_component_sets:
-                        if self.assigned[p,t,c,s].varValue > 0:
+                        if self.assigned[p,t,c,s].varValue > 0.99:
                             if t_i < len(self.product_tasks[p])-1:
                                 t_2 = self.product_tasks[p][t_i+1]
-                                result_workflow_data.append({'Product': p, 'Task/Trans/Changeover': t, 'Station': s, 'Task Time': self.task_times[(t,c)], 
+                                if t_i == 0:
+                                    result_workflow_data.append({'Product': p, 'Task/Trans/Changeover': f"Transport {self.stations[0]}->{s}", 
+                                                                 'Station': self.stations[0], 'Main': None, 'Aux': None, 'Task Time': 0, 
                                                          'Changeover Time': 0, 
-                                                         'Import Time': self.import_times[c] if (t_i == 0 or self.assigned_same_station[p,self.product_tasks[p][t_i-1],t,c,s].varValue == 0) else 0, 
-                                                         'Export Time': self.export_times[c] if (self.assigned_same_station[p,t,self.product_tasks[p][t_i+1],c,s].varValue == 0) else 0,
+                                                         'Import Time': 0, 
+                                                         'Export Time': 0, 
+                                                         'Transport Time': self.transport_times[(self.stations[0],s)]})
+                                result_workflow_data.append({'Product': p, 'Task/Trans/Changeover': t, 'Station': s, 'Main': c, 'Aux': aux_requirements[t,c], 'Task Time': self.task_times[(t,c)], 
+                                                         'Changeover Time': 0, 
+                                                         'Import Time': self.import_times[c] if (t_i == 0 or self.assigned_same_station[p,self.product_tasks[p][t_i-1],t,c,s].varValue < 0.1) else 0, 
+                                                         'Export Time': self.export_times[c] if (self.assigned_same_station[p,t,self.product_tasks[p][t_i+1],c,s].varValue < 0.1) else 0,
                                                          'Transport Time': 0})
-                                if self.assigned_same_station[p,t,self.product_tasks[p][t_i+1],c,s].varValue > 0: 
+                                if self.assigned_same_station[p,t,self.product_tasks[p][t_i+1],c,s].varValue > 0.99: 
                                     result_workflow_data.append({'Product': p, 'Task/Trans/Changeover': f"Changeover {t}->{t_2}", 
-                                                         'Station': s, 'Task Time': 0, 
+                                                         'Station': s, 'Main': c, 'Aux': aux_requirements[t,c], 'Task Time': 0, 
                                                              'Changeover Time': self.assigned_same_station[p,t,t_2,c,s].varValue * self.changeover_times[(c,t,t_2)], 
                                                              'Import Time': 0, 'Export Time': 0, 
                                                          'Transport Time': 0})
-                                if self.assigned_same_station[p,t,self.product_tasks[p][t_i+1],c,s].varValue == 0: 
-                                    result_workflow_data.append({'Product': p, 'Task/Trans/Changeover': f"Transport {s}->{[s_2 for s_2 in self.stations if s != s_2 and self.trans[p,t,t_2,s,s_2].varValue > 0][0]}", 
-                                                         'Station': s, 'Task Time': 0, 
+                                if self.assigned_same_station[p,t,self.product_tasks[p][t_i+1],c,s].varValue < 0.1: 
+                                    result_workflow_data.append({'Product': p, 'Task/Trans/Changeover': f"Transport {s}->{[s_2 for s_2 in self.stations if s != s_2 and self.trans[p,t,t_2,s,s_2].varValue > 0.99][0]}", 
+                                                         'Station': s, 'Main': None, 'Aux': None, 'Task Time': 0, 
                                                              'Changeover Time': 0, 
                                                              'Import Time': 0, 'Export Time': 0, 
                                                          'Transport Time': sum(self.trans[p,t,t_2,s,s_2].varValue * self.transport_times[(s,s_2)] for s_2 in self.stations if s != s_2)})
                             else:
-                                result_workflow_data.append({'Product': p, 'Task/Trans/Changeover': t, 'Station': s, 'Task Time': self.task_times[(t,c)], 
+                                result_workflow_data.append({'Product': p, 'Task/Trans/Changeover': t, 'Station': s, 'Main': c, 'Aux': aux_requirements[t,c], 'Task Time': self.task_times[(t,c)], 
                                                          'Changeover Time': 0, 
                                                          'Import Time': 0, 
                                                          'Export Time': self.export_times[c],
@@ -311,7 +333,7 @@ if __name__ == "__main__":
     aux_component_sets = {'x','y','none'}
     # The invest cost of investing in each component set
     initial_costs = {'X': 3000, 'Y': 2000}
-    aux_initial_costs = {'x': 1000, 'y': 500, 'none':0}
+    aux_initial_costs = {'x': 1000, 'y': 500, 'none':1}
     # the labor cost of each component set
     labor_costs = {'X': 100, 'Y': 50}
     aux_labor_costs = {'x': 0, 'y': 0, 'none':0}
@@ -345,8 +367,10 @@ if __name__ == "__main__":
     # The production_amount of each product in time period
     amount = {'inverter1':3, 'inverter2':4}
     settings = {
-        'flowshop': True,
-        'depreciation': True,
+        'flowshop': False,
+        'batch_production': False,
+        'one_piece_flow': True, # choose batch or one_piece_flow
+        'depreciation': False,
         'depreciation_timespan': 200,
         'labor_cost_on_exact_cycletime': True,
         'max_operator_count': 10,
@@ -373,30 +397,11 @@ if __name__ == "__main__":
         transport_times=transport_times,
         transport_can_be_bottleneck=transport_can_be_bottleneck)
     capp.set_settings(settings=settings)
-    capp.set_solver('PULP_CBC_CMD')
+    capp.set_solver('COIN_CMD')
     capp.solve()
     if all(stat in (pulp.LpStatusOptimal, pulp.LpStatusNotSolved) for stat in capp.statuses):
         capp.format_result()
         capp.print_result_pretty()
-
-    # relaxed_prob, infeasible_constraints = relax_problem.relax_problem(capp.prob)
-    # relaxed_prob.solve()
-    # lpvars = {lpvar.name: lpvar.value() for lpvar in relaxed_prob.variables()}
-    # print(f"infeasible constraints: {infeasible_constraints}")
-    # print(f"{' Objective Value ':=^60}")
-    # print(f"Status: {pulp.LpStatus[relaxed_prob.status]}")
-    # print(f"Objective: {relaxed_prob.objective.value()}")
-    # print(f"{' Variables Values ':=^60}")
-    # for name, value in lpvars.items():
-    #     print(f"{name}: {value}")
-    
-    # print(f"{' Problem Constraints ':=^60}")
-    # for lpname, lpcons in relaxed_prob.constraints.items():
-    #     c = _c = lpcons.__str__().replace('*', ' * ')
-    #     for name, value in lpvars.items():
-    #         c = c.replace(name, str(value))
-    #     res = eval(c)
-    #     print(f"{lpname}: {_c} -> {c} -> {res}")
 
     # productsは別の名前でなくてはならず、同じ製品ならば同じタスクであっても別の名前として登録する必要がある。
     # m4_screw_1, m4_screw_2など。ただし別の製品ならば同じ名前で良い。
@@ -429,7 +434,7 @@ if __name__ == "__main__":
 
     # TODO: すべてのコンポーネントセットを候補とするとModeに比べて数が多く(インバータモックで4→54)、assignとequipの範囲が広くなりすぎ時間がかかる(3min→over60min)。taskごとのtoolReqなどによってModeに対応する部分を自動選別する必要がある。main component set, sub(aux) component set に分類して、mainが決まればcost,timeが決まるようにする。
     # メインとサブで分離することができるのはツール交換、治具交換で対応できる製品・作業が想定されるためであり、これらを別要素として考える必要はないのでは。
-    # TODO: decompositionは複数製品の生産量制約の場合、作業間で分割してsum(overall_cycletime*目標量 for products)<期間の制約を残せば、対応可能。ただしこれまで通りdecompositionはmax_operator_countやmax_stationsが最初の方は意味を持たず、後半で不可能となりうる。分割を辞めるのではなく分割後に部分ごとに数値設定する方法を取ることも考えるべき。
+    # TODO: decompositionは複数製品の生産量制約の場合、作業間で分割してsum(product_cycletime*目標量 for products)<期間の制約を残せば、対応可能。ただしこれまで通りdecompositionはmax_operator_countやmax_stationsが最初の方は意味を持たず、後半で不可能となりうる。分割を辞めるのではなく分割後に部分ごとに数値設定する方法を取ることも考えるべき。
     # TODO: decompositionの中で、すべてのタスクを行えないコンポーネントセット（すべてtasktimeが負の数）の除外を行う。計算時間を大きく減らせる。
     # TODO: decompositionは最適化の中ではなく前処理として行うことで、分割を確認できるし計算時間上限などを管理しやすい。
     # TODO: 最大stationsを自動算出する機能も移植が必要。最も長いtask timeの設備をすべて選択したときに収まる最小のstations数を算出する。
